@@ -38,13 +38,10 @@ library(ggpubr)
 
 Now having loaded in all of the packages that we need we are going to load in all of our data
 ```{r}
-tax_data <- "emu_taxonomic_profile.xlsx" #saving the file as a variable
-sample_data <- "sample_table.xlsx" #saving the sam_table file as a variable which we will load in below
-
-tax_assignment_table <- read_xlsx(tax_data) #loading in the taxonomic data
+tax_assignment_table <- read_xlsx("emu_taxonomic_profile.xlsx") #loading in the taxonomic data
 tax_assignment_table <- tax_assignment_table[!tax_assignment_table$tax_id == "unassigned", ] #removing the unassigned row from our analysis
-sample_table <- read_xlsx(sample_data) #loading in the sample data
-sample_table <- transform(sample_data, concentration = as.numeric(concentration)) #making the concentration column numeric which we need for the decontamination process
+sample_table <- read_xlsx("sample_table.xlsx") #loading in the sample data
+sample_table <- transform(sample_table, concentration = as.numeric(concentration)) #making the concentration column numeric which we need for the decontamination process
 
 #we now need to split our taxonomic assignment table into our otu table and taxonomy table
 otu_table <- tax_assignment_table[ -c(2:8)] #removing the taxonomy to create our otu_table which shows the number of reads for each tax_id
@@ -75,7 +72,7 @@ With our phyloseq object created we can begin our analysis (we are simultaneousl
 
 Using decontam to statistically remove contamination from our data (https://github.com/benjjneb/decontam)
 ```{r}
-phyloseq_data_sub <- subset_samples(phyloseq_data, sample_type =="sample" | sample_type =="resevoir" | sample_type =="control") #subsetting the samples and the controls
+phyloseq_data_sub <- subset_samples(phyloseq_data, sample_type =="sample" | sample_type =="n2_sample" | sample_type =="resevoir" | sample_type =="control") #subsetting the samples and the controls
 
 #below we are using the prevalence method to remove the contamination 
 sample_data(phyloseq_data_sub)$is.neg <- sample_data(phyloseq_data_sub)$sample_type == "control" #have to make a new column with TRUE or FALSE if the sample is a negative control (TRUE) or a sample (FALSE)
@@ -89,7 +86,7 @@ Subsequent analysis will be conducted only on our samples so we can subset our s
 #we first want to subset our data to only include the samples we want to analyze: 
 phyloseq_samples <- subset_samples(phyloseq_data_decontam, sample_type =="sample")
 
-#removing taxa that are not present in our samples (only present in controls or resevoir samples)
+#removing taxa that are not present in our samples (only present in controls or reservoir samples)
 phyloseq_samples <- prune_taxa(taxa_sums(phyloseq_samples)>0, phyloseq_samples) 
 ```
 
@@ -250,7 +247,7 @@ for (i in c(2:ncol(tax_table_new))){ #for each column
       k <- i - 1 #set k
       while (is.na(tax_table_new[j,i])){ #while the value in the row/column is NA
         tax_table_new[j,i] <- tax_table_edit[j,k] #replace the value in that row and column with the value from the previous col
-        output <- print(tax_table_edit[j,k]) #the new value in the cell
+        output <- tax_table_edit[j,k] #the new value in the cell
         k <- k - 1 #reset K
       }
       tax_table_new[j,i] <- paste("unclassified",output, sep = " ") #if we finally have a non NA value replace the value in the cell with the unclassified plus the previous classification
