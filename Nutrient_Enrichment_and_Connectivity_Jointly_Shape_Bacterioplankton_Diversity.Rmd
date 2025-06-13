@@ -1,0 +1,704 @@
+---
+title: "Nutrient Enrichment and Connectivity Jointly Shape Bacterioplankton Diversity"
+author: Akhil Kholwadwala
+output: github_document
+---
+
+## Loading in Packages and Data
+
+Below we download all of the packages we need for the processing and filtering of the raw data, the statistical analysis of the data, and the plotting of the figures
+```{r packages}
+
+install.packages("rmarkdown")
+library(readxl) #used to read in excel files
+library(ggplot2) #used to plot all of our data
+library("dplyr") # allows us to manipulate dataframes
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = '3.20', force = TRUE)
+BiocManager::install("phyloseq", force = TRUE) 
+BiocManager::install("decontam",  force = TRUE)
+BiocManager::install("ANCOMBC", force = TRUE, version = "3.20")
+
+library("phyloseq") #for our analyses 
+library("decontam") #decontam allows us to identify and remove contaminant taxa in our samples
+library(ANCOMBC) #downloading ANCOMBC for our differential abundance analysis
+
+library("tibble") # used to convert column to row names
+library(car) #used to run the levene test
+library(FSA) #loading the necessary package to run the dunn test 
+library(vegan) #for calculating various metrics of diversity
+library(tidyr)
+library(forcats) #need this library in order to reorder our data 
+library(tidypaleo)
+library(RColorBrewer)
+library(ggpubr)
+```
+
+Now having loaded in all of the packages that we need we are going to load in all of our data
+```{r}
+tax_data <- "emu_taxonomic_profile.xlsx" #saving the file as a variable
+sample_data <- "sample_table.xlsx" #saving the sam_table file as a variable which we will load in below
+
+tax_assignment_table <- read_xlsx(tax_data) #loading in the taxonomic data
+tax_assignment_table <- tax_assignment_table[!tax_assignment_table$tax_id == "unassigned", ] #removing the unassigned row from our analysis
+sample_table <- read_xlsx(sample_data) #loading in the sample data
+sample_table <- transform(sample_data, concentration = as.numeric(concentration)) #making the concentration column numeric which we need for the decontamination process
+
+#we now need to split our taxonomic assignment table into our otu table and taxonomy table
+otu_table <- tax_assignment_table[ -c(2:8)] #removing the taxonomy to create our otu_table which shows the number of reads for each tax_id
+tax_table <- tax_assignment_table[ c(1:8)] #isolating only the taxonomy info which shows the taxonomy of each of the tax_ids
+
+#we still need to do a bit of manipulation on our data tables before they can be used in phyloseq
+otu <- otu_table %>% tibble::column_to_rownames("tax_id") #making the tax_id column the row names
+otu_int <- otu %>% mutate_if(is.numeric, round) #converting from declimals to integers (having decimals screws up later analyses)
+tax <- tax_table %>% tibble::column_to_rownames("tax_id") #making the tax_id column the row names
+sam <- sample_table %>% tibble::column_to_rownames("emu_sample_ID") #making the sample_id column the row names
+
+#now the tax and otu table need to be converted to matrices 
+otu_mat <- as.matrix(otu_int) #making the otu table into a matrix
+tax_mat <- as.matrix(tax) #making the taxonomy table into a matrix 
+
+#now we can make everything to a phyloseq objects
+otu_phyl <- otu_table(otu_mat, taxa_are_rows = TRUE) #making our otu_table a phyloseq object
+tax_phyl <- tax_table(tax_mat) #making our tax_table a phyloseq object
+sam_phyl <- sample_data(sam) #making our sam_table a phyloseq object
+
+#making our phyloseq object
+phyloseq_data <- phyloseq(otu_phyl,tax_phyl,sam_phyl) #combining our otu_table our tax_table our sam_table into a single phyloseq object
+```
+
+With our phyloseq object created we can begin our analysis (we are simultaneously following the analyses found here http://deneflab.github.io/MicrobeMiseq/demos/mothur_2_phyloseq.html#permanova)
+
+## Data Filtering
+
+Using decontam to statistically remove contamination from our data (https://github.com/benjjneb/decontam)
+```{r}
+phyloseq_data_sub <- subset_samples(phyloseq_data, sample_type =="sample" | sample_type =="resevoir" | sample_type =="control") #subsetting the samples and the controls
+
+#below we are using the prevalence method to remove the contamination 
+sample_data(phyloseq_data_sub)$is.neg <- sample_data(phyloseq_data_sub)$sample_type == "control" #have to make a new column with TRUE or FALSE if the sample is a negative control (TRUE) or a sample (FALSE)
+contamdf.prev <- isContaminant(phyloseq_data_sub, method="prevalence", neg="is.neg") #using the prevalence method from decontam to remove the contamination
+
+phyloseq_data_decontam <- prune_taxa(!contamdf.prev$contaminant, phyloseq_data_sub) #pruning the contaminant taxa from our dataframe 
+```
+
+Subsequent analysis will be conducted only on our samples so we can subset our samples to include only the samples (removing the control data and the resevoir samples)
+```{r}
+#we first want to subset our data to only include the samples we want to analyze: 
+phyloseq_samples <- subset_samples(phyloseq_data_decontam, sample_type =="sample")
+
+#removing taxa that are not present in our samples (only present in controls or resevoir samples)
+phyloseq_samples <- prune_taxa(taxa_sums(phyloseq_samples)>0, phyloseq_samples) 
+```
+
+## Alpha-Diversity 
+
+Starting with the alpha diversity analyses to see how nutrient enrichment and connectivity independently shape community composition
+```{r}
+phyloseq_richness <- estimate_richness(phyloseq_samples, measures=c("Observed", "Shannon")) #determining estimates of richness
+
+sam_data_for_richness <- sample_data(phyloseq_samples) #getting our sample data 
+row.names(sam_data_for_richness) <- gsub("-threshold-0.001", ".threshold.0.001", row.names(sam_data_for_richness)) #editing the rownames of our sample data so we can merge it with the richness data
+
+phyloseq_richness_sam_data <- merge(phyloseq_richness,sam_data_for_richness,0) #merging the data by row.name
+
+#species richness and nutrient enrichment
+ggplot(phyloseq_richness_sam_data, aes(x=fct_relevel(nutrient, "0", "50", "200"), y=Observed, color=nutrient)) +
+  geom_boxplot() + 
+  xlab("Nutrient Treatment (µg/L/week)") +
+  ylab("Observed Species Richness")+
+  ylim(0,175) +
+  ggtitle("Observed Species Richness at Node1") + 
+  scale_color_manual(name = "Nutrient Treatment (µg/L/week)", values=c("#E6E600", "darkgreen", "#63C600"))+ 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+kruskal.test(Observed ~ nutrient, phyloseq_richness_sam_data) #kruskal-wallis test to see if there are differences in the medians
+
+dunnTest(Observed ~ nutrient, data=phyloseq_richness_sam_data, method = "holm") #dunn_test to determine which groups have significantly different medians 
+
+#shannon diversity and nutrient enrichment 
+ggplot(phyloseq_richness_sam_data, aes(x=fct_relevel(nutrient, "0", "50", "200"), y=Shannon, color=nutrient)) +
+  geom_boxplot() + 
+  xlab("Nutrient Treatment (µg/L/week)") +
+  ylab("Observed Shannon Diversity")+
+  ylim(0,5) +
+  ggtitle("Observed Shannon Diversity at Node1") + 
+  scale_color_manual(name = "Nutrient Treatment (µg/L/week)", values=c("#E6E600", "darkgreen", "#63C600"))+ 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+kruskal.test(Shannon ~ nutrient, phyloseq_richness_sam_data) #kruskal-wallis test to see if there are differences in the medians
+
+dunnTest(Shannon ~ nutrient, data=phyloseq_richness_sam_data, method = "holm") #dunn_test to determine which groups have significantly different medians
+
+#species richness and connectivity
+ggplot(phyloseq_richness_sam_data, aes(x=connectivity, y=Observed, color = connectivity)) +
+  geom_boxplot() + 
+  xlab("Connectivity") +
+  ylab("Observed Species Richness") + 
+  ylim(0,200)+
+  ggtitle("Observed Species Richness at Node1") + 
+  scale_color_manual(name = "Connectivity (% volume/week)", values=c("#9E9E9E", "#03A9F4", "navyblue"))+ 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+kruskal.test(Observed ~ connectivity, phyloseq_richness_sam_data) #kruskal-wallis test to see if there are differences in the medians
+
+dunnTest(Observed ~ connectivity, data=phyloseq_richness_sam_data, method = "holm") #dunn_test to determine which groups have significantly different medians
+
+#shannon diversity and connectivity
+ggplot(phyloseq_richness_sam_data, aes(x=connectivity, y=Shannon, color = connectivity)) +
+  geom_boxplot() + 
+  xlab("Connectivity") +
+  ylab("Observed Shannon Diversity") + 
+  ylim(0,5)+
+  ggtitle("Observed Shannon Diversity at Node1") + 
+  scale_color_manual(name = "Connectivity (% volume/week)", values=c("#9E9E9E", "#03A9F4", "navyblue"))+ 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+kruskal.test(Shannon ~ connectivity, phyloseq_richness_sam_data) #kruskal-wallis test to see if there are differences in the medians
+
+dunnTest(Shannon ~ connectivity, data=phyloseq_richness_sam_data, method = "holm") #dunn_test to determine which groups have significantly different medians
+```
+
+## Beta-Diversity 
+
+We want to first look at how nutrient enrichment and connectivity individually structure bacterioplankton communities 
+```{r}
+set.seed(1)
+
+sample_data_df <- data.frame(sample_data(phyloseq_samples)) #getting a dataframe of our sample table
+
+bray_dist <- phyloseq::distance(phyloseq_samples, method="bray") #calculating the bray-curtis distance between the samples
+phyloseq_bray <- ordinate(phyloseq_samples, "PCoA", "bray") #do the ordination
+
+jaccard_dist <- phyloseq::distance(phyloseq_samples, method="jaccard") #calculating the jaccard distance between the samples
+phyloseq_jaccard <- ordinate(phyloseq_samples, "PCoA", "jaccard")
+
+#nutrient enrichment and bray-curtis distance
+plot_ordination(phyloseq_samples, phyloseq_bray, type="samples", color="nutrient", 
+                  title="OTUs") + 
+  scale_color_manual(values = c("#E6D410", "darkgreen", "#63C600")) + 
+  geom_point(size=2) +
+  stat_ellipse(type = "norm", linetype = 1, linewidth = 1.5) + 
+  theme(axis.text=element_text(size=15)) #plot the ordination
+
+adonis2(bray_dist ~ nutrient, data = sample_data_df) #permanova to see if the samples grouped by nutrient enrichment have significantly different centroids 
+beta_nutr_bray <- betadisper(bray_dist, sample_data_df$nutrient) #this test is to see if the dispersion (the spread of the points in each) group is significantly different
+permutest(beta_nutr_bray) 
+
+#nutrient enrichment and jaccard distance
+plot_ordination(phyloseq_samples, leap_2022_sub_one.ord_jac, type="samples", color="nutrient", 
+                  title="OTUs") + 
+  scale_color_manual(values = c("#E6D410", "darkgreen", "#63C600")) + 
+  geom_point(size=2) +
+  stat_ellipse(type = "norm", linetype = 1, linewidth = 1.5) + 
+  theme(axis.text=element_text(size=15)) #plot the ordination
+
+adonis2(jaccard_dist ~ nutrient, data = sample_data_df) #permanova to see if the samples grouped by nutrient enrichment have significantly different centroids 
+beta_nutr_jaccard <- betadisper(jaccard_dist, sample_data_df$nutrient) #this test is to see if the dispersion (the spread of the points in each) group is significantly different
+permutest(beta_nutr_jaccard) 
+
+#connectivity and bray-curtis distance
+plot_ordination(phyloseq_samples, phyloseq_bray, type="samples", color="connectivity", 
+                  title="OTUs") + 
+  scale_color_manual(values = c("#9E9E9E", "#03A9F4", "navyblue")) + 
+  geom_point(size=2) +
+  stat_ellipse(type = "norm", linetype = 1, linewidth = 1.5) + 
+  theme(axis.text=element_text(size=15)) #plot the ordination
+
+adonis2(bray_dist ~ connectivity, data = sample_data_df) #permanova to see if the samples grouped by nutrient enrichment have significantly different centroids 
+beta_conn_bray <- betadisper(bray_dist, sample_data_df$connectivity) #this test is to see if the dispersion (the spread of the points in each) group is significantly different
+permutest(beta_conn_bray)
+
+#connectivity and jaccard distance 
+leap_2022_sub_one.ord_jac_con <- ordinate(phyloseq_samples, "PCoA", "jaccard")
+plot_ordination(phyloseq_samples, leap_2022_sub_one.ord_jac_con, type="samples", color="connectivity", 
+                  title="OTUs") + 
+  scale_color_manual(values = c("#9E9E9E", "#03A9F4", "navyblue")) + 
+  geom_point(size=2) +
+  stat_ellipse(type = "norm", linetype = 1, linewidth = 1.5) + 
+  theme(axis.text=element_text(size=15)) #plot the ordination
+
+adonis2(jaccard_dist ~ connectivity, data = sample_data_df) #permanova to see if the samples grouped by nutrient enrichment have significantly different centroids 
+beta_conn_jaccard <- betadisper(jaccard_dist, sample_data_df$connectivity) #this test is to see if the dispersion (the spread of the points in each) group is significantly different
+permutest(beta_conn_jaccard)
+
+
+```
+
+## Differential Abundance Analysis 
+
+In order to use ANCOMBC2 for the analysis we have to edit our dataframes to make it compatible with ANCOMBC2
+```{r}
+#in order to use ancombc2 we have to reorder our tax_table in the following way 'domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species'
+new_phyloseq_samples <- phyloseq_samples
+tax_table_reordered <- data.frame(tax_table(new_phyloseq_samples)) #making the tax table a dataframe 
+tax_table_reordered <- tax_table_reordered[, c('superkingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species')] #reordering the tax table
+tax_table_reordered_mat <- as.matrix(tax_table_reordered) #converting the tax table back into a matrix 
+tax_table_reordered_mat_as_tax_table <- tax_table(tax_table_reordered_mat) #making the tax table a tax table again
+tax_table(new_phyloseq_samples) <- tax_table_reordered_mat_as_tax_table #creating a new phyloseq object with the properly order tax table
+
+#we are going to need our tax table to eliminate the NA's and make it unspecified "last identified taxa"
+tax_table_edit <- data.frame(tax_table(new_phyloseq_samples))
+tax_table_new <- tax_table_edit
+
+for (i in c(2:ncol(tax_table_new))){ #for each column
+  for (j in c(1:(nrow(tax_table_new) - 1))){ #for each row (except for the last unspecified row)
+    if (is.na(tax_table_new[j,i])){ #if the value in the specified row and column is NA
+      #print(tax_table_new[j,i])
+      k <- i - 1 #set k
+      while (is.na(tax_table_new[j,i])){ #while the value in the row/column is NA
+        tax_table_new[j,i] <- tax_table_edit[j,k] #replace the value in that row and column with the value from the previous col
+        output <- print(tax_table_edit[j,k]) #the new value in the cell
+        k <- k - 1 #reset K
+      }
+      tax_table_new[j,i] <- paste("unclassified",output, sep = " ") #if we finally have a non NA value replace the value in the cell with the unclassified plus the previous classification
+    }
+  }
+}
+
+tax_table_new_as_matrix <- as.matrix(tax_table_new)
+newer_phyloseq_samples<- new_phyloseq_samples
+tax_table(newer_phyloseq_samples) <- tax_table_new_as_matrix #replacing the tax table with a new one
+```
+
+We now can do the differential abundance analysis with ANCOMBC2
+```{r}
+#now we want to go through and look at the differential abundance between the different nutrient enrichment groups
+set.seed(123)
+
+#looking at the differences between nutrient levels at the level of phylum
+output_nutrient_phylum <- ancombc2(
+      data = newer_phyloseq_samples, #this is the phyloseq object we are going to use for this 
+      tax_level = "phylum", #here is the taxonomic rank at which we want the differential abudnance to be analyzed
+      assay_name = "counts", #we are looking at the counts
+      fix_formula = "connectivity + enrichment + sampling_date", #need to provide a formula which describes the abundances are impacted by fixed effects
+      rand_formula = NULL, #we could theoretically use this section to account for random effects
+      p_adj_method = "holm", #the p-value adjeustment method we are using
+      pseudo_sens = TRUE, 
+      prv_cut = 0.1, #the prevalence threshold for the taxa (in what proportion of the samples must the taxa be present in order to be included in the analysis)
+      lib_cut = 0, #should you filter samples based on library size? 
+      s0_perc = 0.05, 
+      group = "enrichment", #the sample groups whose members we are comparing in the analysis
+      struc_zero = TRUE, #look at structural zeros' based on groups? 
+      neg_lb = FALSE, 
+      alpha = 0.05, #level of significance
+      n_cl = 1,
+      verbose = TRUE,
+      global = FALSE, #perform a global test? global test identifies taxa that show differential abudance between at least two groups 
+      pairwise = FALSE, #perform a pairwise test? does a pairwise differential abundance analysis between the identified groups
+      dunnet = FALSE, #perform a dunnett test? tests experiemntal gorups against a control
+      trend = FALSE, #perform a trend test? 
+      iter_control = list(tol = 0.01, max_iter = 20, verbose = FALSE),
+      em_control = list(tol = 1e-05, max_iter = 100),
+      lme_control = lme4::lmerControl(),
+      mdfdr_control = list(fwer_ctrl_method = "holm", B = 100),
+      trend_control = list(contrast = NULL, node = NULL, solver = "ECOS", B = 100)
+)
+
+output_nutrient_all_phylum <- output_nutrient_phylum$res
+output_nutrient_all_phylum <- output_nutrient_all_phylum %>% mutate(pos_n= lfc_enrichmentunenriched >= 0)
+output_nutrient_all_phylum$tax_rank <- rep("phylum", nrow(output_nutrient_all_phylum))
+
+#looking at the differences between nutrient levels at the level of class
+output_nutrient_class <- ancombc2(
+      data = newer_phyloseq_samples, #this is the phyloseq object we are going to use for this 
+      tax_level = "class", #here is the taxonomic rank at which we want the differential abudnance to be analyzed
+      assay_name = "counts", #we are looking at the counts
+      fix_formula = "connectivity + enrichment + sampling_date", #need to provide a formula which describes the abundances are impacted by fixed effects
+      rand_formula = NULL, #we could theoretically use this section to account for random effects
+      p_adj_method = "holm", #the p-value adjeustment method we are using
+      pseudo_sens = TRUE, 
+      prv_cut = 0.1, #the prevalence threshold for the taxa (in what proportion of the samples must the taxa be present in order to be included in the analysis)
+      lib_cut = 0, #should you filter samples based on library size? 
+      s0_perc = 0.05, 
+      group = "enrichment", #the sample groups whose members we are comparing in the analysis
+      struc_zero = TRUE, #look at structural zeros' based on groups? 
+      neg_lb = FALSE, 
+      alpha = 0.05, #level of significance
+      n_cl = 1,
+      verbose = TRUE,
+      global = FALSE, #perform a global test? global test identifies taxa that show differential abudance between at least two groups 
+      pairwise = FALSE, #perform a pairwise test? does a pairwise differential abundance analysis between the identified groups
+      dunnet = FALSE, #perform a dunnett test? tests experiemntal gorups against a control
+      trend = FALSE, #perform a trend test? 
+      iter_control = list(tol = 0.01, max_iter = 20, verbose = FALSE),
+      em_control = list(tol = 1e-05, max_iter = 100),
+      lme_control = lme4::lmerControl(),
+      mdfdr_control = list(fwer_ctrl_method = "holm", B = 100),
+      trend_control = list(contrast = NULL, node = NULL, solver = "ECOS", B = 100)
+)
+
+output_nutrient_all_class <- output_nutrient_class$res
+output_nutrient_all_class <- output_nutrient_all_class %>% mutate(pos_n= lfc_enrichmentunenriched >= 0)
+output_nutrient_all_class$tax_rank <- rep("class", nrow(output_nutrient_all_class))
+
+#looking at the differences between nutrient levels at the level of order
+output_nutrient_order <- ancombc2(
+      data = newer_phyloseq_samples, #this is the phyloseq object we are going to use for this 
+      tax_level = "order", #here is the taxonomic rank at which we want the differential abudnance to be analyzed
+      assay_name = "counts", #we are looking at the counts
+      fix_formula = "connectivity + enrichment + sampling_date", #need to provide a formula which describes the abundances are impacted by fixed effects
+      rand_formula = NULL, #we could theoretically use this section to account for random effects
+      p_adj_method = "holm", #the p-value adjeustment method we are using
+      pseudo_sens = TRUE, 
+      prv_cut = 0.1, #the prevalence threshold for the taxa (in what proportion of the samples must the taxa be present in order to be included in the analysis)
+      lib_cut = 0, #should you filter samples based on library size? 
+      s0_perc = 0.05, 
+      group = "enrichment", #the sample groups whose members we are comparing in the analysis
+      struc_zero = TRUE, #look at structural zeros' based on groups? 
+      neg_lb = FALSE, 
+      alpha = 0.05, #level of significance
+      n_cl = 1,
+      verbose = TRUE,
+      global = FALSE, #perform a global test? global test identifies taxa that show differential abudance between at least two groups 
+      pairwise = FALSE, #perform a pairwise test? does a pairwise differential abundance analysis between the identified groups
+      dunnet = FALSE, #perform a dunnett test? tests experiemntal gorups against a control
+      trend = FALSE, #perform a trend test? 
+      iter_control = list(tol = 0.01, max_iter = 20, verbose = FALSE),
+      em_control = list(tol = 1e-05, max_iter = 100),
+      lme_control = lme4::lmerControl(),
+      mdfdr_control = list(fwer_ctrl_method = "holm", B = 100),
+      trend_control = list(contrast = NULL, node = NULL, solver = "ECOS", B = 100)
+)
+
+output_nutrient_all_order <- output_nutrient_order$res
+output_nutrient_all_order <- output_nutrient_all_order %>% mutate(pos_n= lfc_enrichmentunenriched >= 0)
+output_nutrient_all_order$tax_rank <- rep("order", nrow(output_nutrient_all_order))
+
+#now we want to merge all of the data, only including the taxa that are significantly differentially abundant prior to p_adjustment 
+output_nutrient_merged <- rbind(output_nutrient_all_phylum[output_nutrient_all_phylum$p_enrichmentunenriched <= 0.05,], output_nutrient_all_class[output_nutrient_all_class$p_enrichmentunenriched <= 0.05,], output_nutrient_all_order[output_nutrient_all_order$p_enrichmentunenriched <= 0.05,])
+
+new_output_nutrient_merged <- output_nutrient_merged %>%
+  arrange(factor(output_nutrient_merged$tax_rank, levels = c("order", "class", "phylum")), lfc_enrichmentunenriched) 
+
+new_output_nutrient_merged$taxon <- factor(new_output_nutrient_merged$taxon, levels = unique(new_output_nutrient_merged$taxon))
+
+#plotting the phyla that are differentially abundant
+ggplot(new_output_nutrient_merged[new_output_nutrient_merged$tax_rank == "phylum",], aes(x = reorder(taxon, lfc_enrichmentunenriched), y = lfc_enrichmentunenriched, fill = pos_n)) + 
+  facet_wrap(~tax_rank, ncol = 1, strip.position = "right") +
+  geom_bar(stat="identity") + 
+  coord_flip() + 
+  ylab("Log Fold Change") + 
+  xlab("Taxon") +
+  ggtitle("Log-Fold Change Between Enriched and Unenriched Nutrient Treatments") +
+  scale_fill_manual(values = c("#369502", "#e6e600"))+
+  ylim(-2, 3.2)+ 
+  theme(axis.text=element_text(size=20), strip.text.y = element_text(size=20))
+
+#plotting the classes that are differentially abundant
+ggplot(new_output_nutrient_merged[new_output_nutrient_merged$tax_rank == "class",], aes(x = reorder(taxon, lfc_enrichmentunenriched), y = lfc_enrichmentunenriched, fill = pos_n)) + 
+  facet_wrap(~tax_rank, ncol = 1, strip.position = "right") +
+  geom_bar(stat="identity") + 
+  coord_flip() + 
+  ylab("Log Fold Change") + 
+  xlab("Taxon") +
+  ggtitle("Log-Fold Change Between Enriched and Unenriched Nutrient Treatments") +
+  scale_fill_manual(values = c("#369502", "#e6e600")) +
+  ylim(-2, 3.2)+ 
+  theme(axis.text=element_text(size=20), strip.text.y = element_text(size=20))
+
+#plotting the orders that are differentially abundant
+ggplot(new_output_nutrient_merged[new_output_nutrient_merged$tax_rank == "order",], aes(x = reorder(taxon, lfc_enrichmentunenriched), y = lfc_enrichmentunenriched, fill = pos_n)) + 
+  facet_wrap(~tax_rank, ncol = 1, strip.position = "right") +
+  geom_bar(stat="identity") + 
+  coord_flip() + 
+  ylab("Log Fold Change") + 
+  xlab("Taxon") +
+  ggtitle("Log-Fold Change Between Enriched and Unenriched Nutrient Treatments") +
+  scale_fill_manual(values = c("#369502", "#e6e600"))+
+  ylim(-2, 3.2)+ 
+  theme(axis.text=element_text(size=20), strip.text.y = element_text(size=20)) #this is here to increase the size of the axis labels
+
+#outputting the dataframe of the results
+new_output_nutrient_merged[,c("taxon", "W_enrichmentunenriched", "q_enrichmentunenriched", "tax_rank", "p_enrichmentunenriched", "diff_enrichmentunenriched")]
+```
+
+## Alpha-Diversity GLMs
+
+Constructing our generalized linear models 
+```{r}
+#in order to do this we are first going to change the connectivity and nutrient enrichment values from characters to numerical:
+num_phyloseq_richness_sam_data <- phyloseq_richness_sam_data #creating a new dataframe which will have the nutrient and connectivity values as numerical
+num_phyloseq_richness_sam_data <- transform(num_phyloseq_richness_sam_data, nutrient = as.numeric(nutrient)) #converting the nutrient data to numeric
+num_phyloseq_richness_sam_data <- transform(num_phyloseq_richness_sam_data, connectivity = as.numeric(connectivity)) #converting the connectivity data to numeric
+
+#need to add a grouping column in order to our LEAP sample data in order to group it by both nutrient and connectivity
+phyloseq_richness_sam_data_new <- phyloseq_richness_sam_data
+phyloseq_richness_sam_data_new$grouping <- paste(phyloseq_richness_sam_data_new$nutrient, phyloseq_richness_sam_data_new$connectivity)
+
+#GLM of Species Richness
+richness_glm_cont <- glm(formula = Observed ~ connectivity + nutrient + connectivity:nutrient + sampling_date, data = num_phyloseq_richness_sam_data, family = "poisson") 
+
+#we now want to try to plot the results of the glm following the methods laid out here https://www.theanalysisfactor.com/r-glm-plotting/
+#calculating the 95% confidence interval for both with + or - 1.96 times the standard error
+x_nut <- seq(0,200,1) #getting the values for the nutrient for which we want to calculate the predictions of the glm 
+#running the predict functions for all values of our nutrient levels with the three levels of connectivity and the two sampling dates 
+y_nut_richness <- predict(richness_glm_cont, 
+                         list(connectivity = c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut))), 
+                              nutrient = c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut), 
+                              sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)))), type = "response", se.fit=TRUE) 
+
+#below we create the data frame that we will use to plot the GLM line
+df_nut_glm_richness <- data.frame(Observed=y_nut_richness$fit, 
+                         SE=y_nut_richness$se.fit,
+                         nutrient=c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut),
+                         connectivity = as.character(c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)))),
+                         sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut))))
+
+#we want to add the upper and lower confidence intervals to the dataframe
+df_nut_glm_richness <- mutate(df_nut_glm_richness, upper = Observed + (1.96 * SE), lower = Observed - (1.96 * SE))
+
+#adding a grouping column which we need in order to add the line to our box existing plot
+df_nut_glm_richness$grouping <- paste(df_nut_glm_richness$nutrient, df_nut_glm_richness$connectivity)
+
+ggplot(phyloseq_richness_sam_data_new, aes(x=as.numeric(nutrient), y=Observed, group = grouping, color=fct_relevel(connectivity, "0", "20", "40"))) +
+  geom_boxplot() + 
+  xlab("Nutrient Treatment (µg/L/week)") +
+  scale_x_continuous() + 
+  ylab("Observed Species Richness") + 
+  ggtitle("Observed Species Richness at Node1") + 
+  scale_color_manual(name = "Connectivity (% volume/week)", values=c("#9E9E9E", "#03A9F4", "navyblue")) + 
+  geom_line(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44791, ], aes(x=nutrient, y=Observed, color = connectivity, group = connectivity), lty=1) + 
+  geom_line(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44838, ], aes(x=nutrient, y=Observed, color = connectivity, group = connectivity), lty=2) + 
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44791 & df_nut_glm_richness$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25) + 
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44791 & df_nut_glm_richness$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25) + 
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44791 & df_nut_glm_richness$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25) +
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44838 & df_nut_glm_richness$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25) + 
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44838 & df_nut_glm_richness$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25) + 
+  geom_ribbon(data = df_nut_glm_richness[df_nut_glm_richness$sampling_date == 44838 & df_nut_glm_richness$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.25)+ 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+#GLM of Shannon Diversity 
+shannon_glm_cont <- glm(formula = Shannon ~ connectivity + nutrient + connectivity:nutrient + sampling_date, data = num_phyloseq_richness_sam_data, family = "gaussian")
+
+x_nut <- seq(0,200,1) #getting the values for the nutrient for which we want to calculate the predictions of the glm 
+#running the predict functions for all values of our nutrient levels with the three levels of connectivity and the two sampling dates 
+y_nut_shannon <- predict(shannon_glm_cont, 
+                         list(connectivity = c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut))), 
+                              nutrient = c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut), 
+                              sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)))), type = "response", se.fit=TRUE) 
+
+#below we create the dataframe that we will use to plot the GLM line
+df_nut_glm_shannon <- data.frame(Shannon=y_nut_shannon$fit, 
+                         SE=y_nut_shannon$se.fit,
+                         nutrient=c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut),
+                         connectivity = as.character(c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)))),
+                         sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut))))
+
+#we want to add the upper and lower confidence intervals to the dataframe
+df_nut_glm_shannon <- mutate(df_nut_glm_shannon, upper = Shannon + (1.96 * SE), lower = Shannon - (1.96 * SE))
+
+#adding a grouping column which we need in order to add the line to our box existing plot
+df_nut_glm_shannon$grouping <- paste(df_nut_glm_shannon$nutrient, df_nut_glm_shannon$connectivity)
+
+ggplot(phyloseq_richness_sam_data_new, aes(x=as.numeric(nutrient), y=Shannon, group = grouping, color=fct_relevel(connectivity, "0", "20", "40"))) +
+  geom_boxplot() + 
+  xlab("Nutrient Treatment (µg/L/week)") +
+  scale_x_continuous() + 
+  ylab("Shannon Diversity") + 
+  ggtitle("Shannon Diversity") + 
+  scale_color_manual(name = "Connectivity (% volume/week)", values=c("#9E9E9E", "#03A9F4", "navyblue")) + 
+  geom_line(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44791, ], aes(x=nutrient, y=Shannon, color = connectivity, group = connectivity), lty=1) + 
+  geom_line(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44838, ], aes(x=nutrient, y=Shannon, color = connectivity, group = connectivity), lty=2) + 
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44791 & df_nut_glm_shannon$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44791 & df_nut_glm_shannon$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44791 & df_nut_glm_shannon$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) +
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44838 & df_nut_glm_shannon$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44838 & df_nut_glm_shannon$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_nut_glm_shannon[df_nut_glm_shannon$sampling_date == 44838 & df_nut_glm_shannon$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  theme(axis.text=element_text(size=15)) #this is here to increase the size of the axis labels
+
+```
+
+## Functional Analysis 
+
+We need to prep our data to be imported into linux
+```{r}
+#we now want to do the functional analysis on the decontaminated data
+otu_table_phyloseq_decontam <- data.frame(otu_table(phyloseq_data_decontam))
+tax_table_phyloseq_decontam <- data.frame(tax_table(phyloseq_data_decontam))
+
+#we want to remerge the otu table and the tax_table back into a single table 
+table_for_faprotax <- merge(otu_table_phyloseq_decontam, tax_table_phyloseq_decontam, by =0)
+
+#now we want to merge all of the tax columns into a single one
+final_table_for_faprotax <- table_for_faprotax %>% unite(taxonomy, superkingdom, phylum, class, order, family, genus, species, sep = ";")
+
+#now we have our faprotax table that we are going to upload into linux and use to run faprotax on!
+#first we export it as a tsv file
+write.table(final_table_for_faprotax, sep = "\t", file = "phyloseq_for_FAPROTAX.tsv", row.names = FALSE)
+```
+
+Here is the code that we ran for FAPROTAX on linux 
+
+~/FAPROTAX_1.2.10/collapse_table.py -i phyloseq_for_FAPROTAX.tsv -o phyloseq_functional_table.tsv -g ~/FAPROTAX_1.2.10/FAPROTAX.txt -c "#" -d "taxonomy" --omit_columns 0 -r phyloseq_report.txt -n columns_after_collapsing -v
+
+We can now import the results from linux 
+```{r}
+phyloseq_function <- "phyloseq_functional_table.xlsx" #setting the file name as a variable so we can load it in
+phyloseq_func <- read_xlsx(phyloseq_function) #reading in the dataframe
+
+phyloseq_func_new <- phyloseq_func[rowSums(phyloseq_func[,-1])>0,] #removing the functional classes for which all values are 0
+phyloseq_func_new[phyloseq_func_new == 0] <- NA #replacing 0 with NA
+phyloseq_func_new_transformed <- data.frame(phyloseq_func_new %>% gather(key, Abundance, -group)) 
+phyloseq_sam_for_func <- data.frame(sam_data(phyloseq_data_decontam)) %>%
+  tibble::rownames_to_column("key") #editing our sample dataframe so that we can merge it with our functional dataframe
+phyloseq_sam_for_func_1 <- phyloseq_sam_for_func[phyloseq_sam_for_func$sample_type=="sample",]
+
+phyloseq_func_sam <- merge(phyloseq_func_new_transformed, phyloseq_func_sam, by = "key") #combining our functional table and our sample table into a single dataframe for analysis 
+```
+
+We can now look at how the abundance of various functional groups changes with nutrient enrichment 
+```{r}
+
+#here is a vector of the specific functions we are interested at looking at
+func_of_int <- c("methanotrophy", "methanol_oxidation", "methylotrophy", "sulfate_respiration", "sulfur_respiration", "thiosulfate_respiration", "respiration_of_sulfur_compounds", "arsenate_respiration", "dissimilatory_arsenate_reduction", "arsenite_oxidation_detoxification", "dissimilatory_arsenite_oxidation", "nitrate_denitrification", "nitrite_denitrification", "denitrification", "chitinolysis",
+"knallgas_bacteria", "dark_hydrogen_oxidation", "nitrite_ammonification", "nitrogen_fixation", "nitrite_respiration", "cellulolysis", "xylanolysis", "dark_sulfide_oxidation", "dark_sulfur_oxidation", "dark_oxidation_of_sulfur_compounds", "manganese_oxidation", "fermentation", "aerobic_chemoheterotrophy", "hydrocarbon_degradation", "aromatic_hydrocarbon_degradation","aromatic_compound_degradation", "hydrocarbon_degradation", "dark_iron_oxidation", "iron_respiration", "nitrate_respiration", "nitrate_reduction", "nitrogen_respiration", "fumarate_respiration","photosynthetic_cyanobacteria", "anoxygenic_photoautotrophy_H2_oxidizing", "anoxygenic_photoautotrophy_S_oxidizing", "anoxygenic_photoautotrophy_Fe_oxidizing", "anoxygenic_photoautotrophy", "oxygenic_photoautotrophy", "photoautotrophy", "aerobic_anoxygenic_phototrophy", "photoheterotrophy", "phototrophy", "ureolysis", "plastic_degradation", "chemoheterotrophy")
+
+#we want to figure out if there is statistically significant differences in the abundances of the various funcitonal classes in our data
+phyloseq_func_stats<-data.frame(matrix(ncol = 7, nrow = 0)) #creating an empty dataframe that we will merge to
+colnames(phyloseq_func_stats) <- c("function", "mann_whit_nutr_p", "W_nutr_p", "kruskal_conn", "p_adj_0_20", "p_adj_0_40", "p_adj_20_40")
+
+#below we are iterating through the different functional groups of interest and determining using a kruskal wallis test if there is a significant difference btween the medians of the groups (defined by the treatment conditions) 
+for (i in func_of_int){
+  p_sam <- length(phyloseq_func_sam[phyloseq_func_sam$group==i & phyloseq_func_sam$Abundance != 0,]$Abundance) / length(phyloseq_func_sam[phyloseq_func_sam$group==i,]$Abundance) #determining the proportion of samples our functional class is found in
+  #following the procedure from differential abundance analysis we are going to eliminate any classes that are found in less than 10% of the samples 
+  if (p_sam >= 0.1){
+    #--------------------Nutrient-----------------------
+    mann_whit_nutr <- wilcox.test(Abundance ~ enrichment, 
+               phyloseq_func_sam[phyloseq_func_sam$group==i,]) #looking at if there if there is a significant difference between each of the nutrient groups
+    #have to use the mann-whitney u test as our values are not normally distributed
+    mann_whit_nutr_p <- mann_whit_nutr$p.value
+    mann_whit_nutr_W <- mann_whit_nutr$statistic
+
+    #--------------------Connectivity-----------------------
+    krus_conn <- kruskal.test(Abundance ~ connectivity, 
+               phyloseq_func_sam[phyloseq_func_sam$group==i,]) #looking at if there if there is a significant difference between each of the connectivity groups
+    kruskal_conn <- krus_conn$p.value
+    dunn_conn <- dunnTest(Abundance ~ connectivity,
+           data=phyloseq_func_sam[phyloseq_func_sam$group==i,], method = "holm")
+    p_adj_0_20 <- dunn_conn$res[dunn_conn$res$Comparison == "0 - 20",]$P.adj
+    p_adj_0_40 <- dunn_conn$res[dunn_conn$res$Comparison == "0 - 40",]$P.adj
+    p_adj_20_40 <- dunn_conn$res[dunn_conn$res$Comparison == "20 - 40",]$P.adj
+    
+    #-------
+    to_append <- c(i, mann_whit_nutr_p, mann_whit_nutr_W,kruskal_conn, p_adj_0_20, p_adj_0_40, p_adj_20_40)
+    phyloseq_func_stats[nrow(phyloseq_func_stats) + 1,] <- to_append #appending this value to the df
+  }
+}
+
+#because we are doing multiple comparisons we want to adjust our p-values with the holm method 
+#we have to do the correction with all of the tests we did not just the significant ones
+phyloseq_func_stats$holm_adjusted_p_nutr <- p.adjust(phyloseq_func_stats$mann_whit_nutr_p, method="holm") 
+
+
+#now we can isolate the functions significant after the multiple testing correction 
+phyloseq_func_stats_adj_sig <- phyloseq_func_stats[as.numeric(phyloseq_func_stats$holm_adjusted_p_nutr) <= 0.05,]
+phyloseq_func_stats[as.numeric(phyloseq_func_stats$mann_whit_nutr_p) <= 0.05,c("function", "mann_whit_nutr_p", "W_nutr_p", "holm_adjusted_p_nutr")]
+
+#getting a subset of the functional classes to plot
+phyloseq_func_of_int_new <- phyloseq_func_sam[phyloseq_func_sam$group=="methanotrophy" |  phyloseq_func_sam$group== "methylotrophy" | phyloseq_func_sam$group=="chitinolysis" | phyloseq_func_sam$group=="nitrogen_fixation" | phyloseq_func_sam$group=="nitrogen_respiration" | phyloseq_func_sam$group=="nitrate_respiration" | phyloseq_func_sam$group=="nitrate_reduction" | phyloseq_func_sam$group=="cellulolysis" | phyloseq_func_sam$group=="xylanolysis" | phyloseq_func_sam$group=="manganese_oxidation"| phyloseq_func_sam$group=="dark_sulfide_oxidation" | phyloseq_func_sam$group=="dark_iron_oxidation" | phyloseq_func_sam$group== "iron_respiration" | phyloseq_func_sam$group=="photoautotrophy" | phyloseq_func_sam$group=="aerobic_anoxygenic_phototrophy" | phyloseq_func_sam$group=="photoheterotrophy" | phyloseq_func_sam$group=="chemoheterotrophy" | phyloseq_func_sam$group=="phototrophy" | phyloseq_func_sam$group=="fermentation", ] 
+
+#want to plot the abundances on a single plot but we want a custom order 
+phyloseq_func_of_int_new$group <- factor(phyloseq_func_of_int_new$group, levels = c('manganese_oxidation', 'dark_sulfide_oxidation', 'dark_iron_oxidation', 'iron_respiration', 'chitinolysis', 'cellulolysis', 'xylanolysis', 'methanotrophy', 'methylotrophy', 'fermentation', 'nitrogen_fixation', 'nitrogen_respiration', 'nitrate_respiration', 'nitrate_reduction', 'aerobic_anoxygenic_phototrophy', 'photoheterotrophy', 'photoautotrophy', 'phototrophy', 'chemoheterotrophy'))
+
+#we can now plot the data
+ggplot(phyloseq_func_of_int_new, 
+       aes(x=group, y=Abundance, fill = enrichment)) + 
+  geom_bar(position="dodge", stat="summary", fun="median") +
+  coord_flip() + 
+  scale_fill_manual(name = "Enrichment Status", values=c("#369502", "#E6E600"))  +
+  geom_point(aes(x=group, y=Abundance, color = enrichment), position=position_dodge(.9)) + 
+  scale_color_manual(name = "Enrichment Status", values=c("#266801", "#a1a100")) +
+  geom_errorbar(stat = "summary", fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, width = 0.5, position=position_dodge(.9)) + 
+  theme(axis.text=element_text(size=15))
+```
+
+Below we construct a GLM of our functional data 
+```{r}
+
+#i also want to do the see how thge funcitonal diversity is impacted by connectivity and enrichment 
+phyloseq_func_t <- data.table::transpose(phyloseq_func) #transposing the dataframe containing the fucntional data
+row.names(phyloseq_func_t) <- colnames(phyloseq_func)
+colnames(phyloseq_func_t) <- phyloseq_func_t[1,]
+phyloseq_func_t_final <- phyloseq_func_t[-1,]
+
+phyloseq_func_t_final <- mutate_all(leap_2022_func_t_final, function(x) as.numeric(as.character(x))) #converting the values to numeric to allow it to be used in the analysis
+
+#now that we have transposed the dataframes we can calculate the richness and the shannon diversity
+phyloseq_func_richness <- data.frame(specnumber(phyloseq_func_t_func_t_final)) #calculating the richness
+phyloseq_func_shannon <- data.frame(diversity(phyloseq_func_t_func_t_final, )) #calculating the shannon diversity 
+
+phyloseq_func_diversity <- merge(phyloseq_func_shannon, phyloseq_func_richness, 0) #merging the two diversity metrics into single table 
+row.names(phyloseq_func_diversity) <- phyloseq_func_diversity[,1] #setting the row name
+phyloseq_func_diversity <- phyloseq_func_diversity[,-1] #removing the first column which is the row names
+
+#editing the sample data so that we can merge it with the functional diversity data frame above
+row.names(phyloseq_sam_for_func_1) <- phyloseq_sam_for_func_1[,1] #setting the row name
+phyloseq_sam_for_func_1 <- phyloseq_sam_for_func_1[,-1] #removing the first column which is the row names
+phyloseq_func_div_sam_data_final <- merge(phyloseq_func_diversity, phyloseq_sam_for_func_1, 0) #adding the sample data to the richness data frame
+
+#making a data_table with numerical nutrient and connectivity values
+phyloseq_func_div_num <- phyloseq_func_div_sam_data_final
+
+phyloseq_func_div_num <- transform(phyloseq_func_div_num,
+                             nutrient = as.numeric(nutrient)) #converting the nutrient data to numeric
+
+phyloseq_func_div_num <- transform(phyloseq_func_div_num,
+                             connectivity = as.numeric(connectivity)) #converting the connectivity data to numeric
+
+#now we can describe a continuous glm
+func_glm <- glm(formula = specnumber.phyloseq_func_t_final. ~ connectivity + nutrient + connectivity:nutrient + sampling_date, data = leap_2022_func_div_num, family = "poisson")
+
+#we now want to try to plot the results of the glm folowing the methods laid out here https://www.theanalysisfactor.com/r-glm-plotting/
+#calculating the 95% confidence interval for both with + or - 1.96 times the standard error
+#we will first plot it by nutrient
+x_nut <- seq(0,200,1) #getting the values for the nutrient for which we want to calculate the predictions of the glm 
+y_nut_func_richness <- predict(func_glm, 
+                         list(connectivity = c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut))), 
+                              nutrient = c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut), 
+                              sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)))), type = "response", se.fit=TRUE) #running the predict functions for all values of our nutrient levels with the three levels of connectivity and the two sampling dates 
+
+#below we create the dataframe that we will use to plot the glm line
+df_func_glm <- data.frame(specnumber.phyloseq_func_t_final.=y_nut_func_richness$fit, 
+                         SE=y_nut_func_richness$se.fit,
+                         nutrient=c(x_nut, x_nut, x_nut, x_nut, x_nut, x_nut),
+                         connectivity = as.character(c(rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)), rep(0, length(x_nut)), rep(20, length(x_nut)), rep(40, length(x_nut)))),
+                         sampling_date = c(rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44791", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut)), rep("44838", length(x_nut))))
+
+#we want to add the upper and lower confidence intervals to the dataframe
+df_func_glm <- mutate(df_func_glm, upper = specnumber.phyloseq_func_t_final. + (1.96 * SE), lower = specnumber.phyloseq_func_t_final. - (1.96 * SE))
+
+#adding a grouping column which we need in order to add the line to our box existing plot
+df_func_glm$grouping <- paste(df_func_glm$nutrient, df_func_glm$connectivity)
+
+#need to add a grouping column in order to our LEAP sample data in order to group it by both nutrient and connectivity
+phyloseq_func_div_sam_data_final_new <- phyloseq_func_div_sam_data_final
+phyloseq_func_div_sam_data_final_new$grouping <- paste(phyloseq_func_div_sam_data_final_new$nutrient, phyloseq_func_div_sam_data_final_new$connectivity)
+
+ggplot(phyloseq_func_div_sam_data_final_new, aes(x=as.numeric(nutrient), y=specnumber.phyloseq_func_t_final., group = grouping, color=fct_relevel(connectivity, "0", "20", "40"))) +
+  geom_boxplot() + 
+  xlab("Nutrient Treatment (µg/L/week)") +
+  ylim(10, 42) + 
+  scale_x_continuous() + 
+  ylab("Observed Functional Richness") + 
+  ggtitle("Observed Functional Richness at Node1") + 
+  scale_color_manual(name = "Connectivity (% volume/week)", values=c("#9E9E9E", "#03A9F4", "navyblue")) + 
+  geom_line(data = df_func_glm[df_func_glm$sampling_date == 44791, ], aes(x=nutrient, y= specnumber.phyloseq_func_t_final., color = connectivity, group = connectivity), lty=1) + 
+  geom_line(data = df_func_glm[df_func_glm$sampling_date == 44838, ], aes(x=nutrient, y= specnumber.phyloseq_func_t_final., color = connectivity, group = connectivity), lty=2) + 
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44791 & df_func_glm$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44791 & df_func_glm$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44791 & df_func_glm$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) +
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44838 & df_func_glm$connectivity == 0, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44838 & df_func_glm$connectivity == 20, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) + 
+  geom_ribbon(data = df_func_glm[df_func_glm$sampling_date == 44838 & df_func_glm$connectivity == 40, ], aes(x=nutrient, ymin=lower, ymax=upper, group = connectivity), fill = "#9e9e9e", color = NA, alpha = 0.15) +
+  theme(axis.text=element_text(size=15))
+
+```
+
+
+
